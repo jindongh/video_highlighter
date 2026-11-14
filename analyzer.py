@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -43,7 +44,10 @@ _MAX_RETRIES = 5
 _INITIAL_BACKOFF_S = 2.0
 _INTER_REQUEST_DELAY_S = 2.0
 _FILE_POLL_INTERVAL_S = 5
-_PROXY_THRESHOLD_BYTES = 80 * 1024 * 1024  # 80 MB
+
+# Gemini Files API free tier limit is 2.0 GB (2,147,483,648 bytes)
+_MAX_GEMINI_FILE_BYTES = int(1.95 * 1024 * 1024 * 1024)   # 1.95 GB safe threshold
+_TARGET_CHUNK_BYTES = int(1.5 * 1024 * 1024 * 1024)      # 1.5 GB target per chunk
 
 
 
@@ -173,45 +177,34 @@ def _get_response_schema() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def analyze_video(
+def _analyze_single_file_direct(
     file_path: str,
-    client: genai.Client | None = None,
-) -> VideoAnalysis:
-    """Upload a video directly to Gemini and return a structured highlight analysis.
-
-    Uploads the original video file directly via the Files API (no local ffmpeg
-    transcoding overhead), polls until ACTIVE, and queries Gemini 3.8 Flash.
-
-    Args:
-        file_path: Local path to the video file.
-        client: Optional pre-initialised :class:`genai.Client`.
+    client: genai.Client,
+    display_name: str | None = None,
+) -> tuple[bool, str, list[Highlight]]:
+    """Upload and analyze a single video file (<= 2GB) using the Gemini API.
 
     Returns:
-        A populated :class:`VideoAnalysis` instance.
+        tuple of (is_basketball, summary, highlights).
     """
     path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Video file not found: {file_path}")
-
-    if client is None:
-        client = genai.Client()
+    name = display_name or path.name
+    size_mb = path.stat().st_size / (1024 * 1024)
 
     uploaded_file = None
     try:
-        # -- 1. Upload directly (0% CPU usage, no ffmpeg transcode) --
-        size_mb = path.stat().st_size / (1024 * 1024)
-        print(f"  ↑ Uploading {path.name} ({size_mb:.1f}MB) directly to Gemini …")
+        # -- 1. Upload directly --
+        print(f"  ↑ Uploading {name} ({size_mb:.1f}MB) directly to Gemini …")
         uploaded_file = client.files.upload(file=str(path))
 
         # -- 2. Wait for Gemini cloud processing --
-        print(f"  ⏳ Waiting for Gemini cloud processing for {path.name} …")
+        print(f"  ⏳ Waiting for Gemini cloud processing for {name} …")
         while not uploaded_file.state or uploaded_file.state.name != "ACTIVE":
             time.sleep(_FILE_POLL_INTERVAL_S)
             uploaded_file = client.files.get(name=uploaded_file.name)
 
-
         # -- 3. Analyse with retries --
-        print(f"  🔍 Analysing {path.name} …")
+        print(f"  🔍 Analysing {name} …")
         interaction = _request_with_backoff(client, uploaded_file)
 
         # -- 4. Parse --
@@ -237,23 +230,11 @@ def analyze_video(
             )
             for h in raw.get("highlights", [])
         ]
-
-        # Extract EXIF creation time for chronological sorting
-        info = get_video_info(file_path)
-        video_creation_time = info.created_at if info else None
-
-        analysis = VideoAnalysis(
-            file_path=file_path,
-            is_basketball=raw.get("is_basketball", False),
-            summary=raw.get("summary", ""),
-            highlights=highlights,
-            creation_time=video_creation_time,
+        return (
+            raw.get("is_basketball", False),
+            raw.get("summary", ""),
+            highlights,
         )
-        print(
-            f"  ✅ Found {len(highlights)} highlight(s) in {path.name}"
-        )
-        return analysis
-
 
     finally:
         # -- 5. Clean up remote file on Gemini --
@@ -261,7 +242,169 @@ def analyze_video(
             try:
                 client.files.delete(name=uploaded_file.name)
             except Exception:
-                pass  # best-effort cleanup
+                pass
+
+
+def _get_video_duration_fallback(file_path: str) -> float:
+    """Get video duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(res.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _split_and_analyze_large_video(
+    file_path: str,
+    client: genai.Client,
+) -> VideoAnalysis:
+    """Automatically split a >2GB video into chunks using stream-copy, analyze each, and merge results."""
+    path = Path(file_path)
+    file_size = path.stat().st_size
+    size_gb = file_size / (1024 * 1024 * 1024)
+
+    # 1. Get video duration
+    info = get_video_info(file_path)
+    duration = info.duration_seconds if (info and info.duration_seconds > 0) else _get_video_duration_fallback(file_path)
+    if duration <= 0:
+        raise ValueError(f"Unable to determine duration for large file: {file_path}")
+
+    # 2. Calculate chunk count (each targeting <= 1.5GB)
+    num_chunks = max(2, math.ceil(file_size / _TARGET_CHUNK_BYTES))
+    chunk_duration = duration / num_chunks
+
+    print(
+        f"\n  ⚠️  Notice: {path.name} ({size_gb:.2f}GB) exceeds Gemini free tier single-file limit (2.0GB).\n"
+        f"  ✂️  Auto-splitting into {num_chunks} chunks (~{chunk_duration:.1f}s each) with fast stream-copy (-c copy)..."
+    )
+
+    all_highlights: list[Highlight] = []
+    summaries: list[str] = []
+    is_basketball_overall = False
+
+    # 3. Process chunk by chunk: create chunk -> analyze -> delete chunk (minimizes disk space)
+    for i in range(num_chunks):
+        start_time = i * chunk_duration
+        seg_duration = chunk_duration if i < num_chunks - 1 else (duration - start_time)
+        temp_chunk = Path(tempfile.gettempdir()) / f"chunk_{i+1}of{num_chunks}_{path.stem}{path.suffix}"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start_time:.2f}",
+            "-i", file_path,
+            "-t", f"{seg_duration:.2f}",
+            "-c", "copy",
+            str(temp_chunk),
+        ]
+
+        print(f"\n  [Chunk {i+1}/{num_chunks}] Extracting segment {start_time:.1f}s ~ {start_time + seg_duration:.1f}s...")
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            chunk_size_mb = temp_chunk.stat().st_size / (1024 * 1024)
+            print(f"  [Chunk {i+1}/{num_chunks}] Created temporary chunk ({chunk_size_mb:.1f}MB) in <1s.")
+
+            # Analyze chunk via Gemini
+            is_bball, summary, highlights = _analyze_single_file_direct(
+                str(temp_chunk),
+                client,
+                display_name=f"{path.name} [Part {i+1}/{num_chunks}]",
+            )
+
+            if is_bball:
+                is_basketball_overall = True
+
+            if summary:
+                summaries.append(f"Part {i+1} ({start_time:.0f}s-{start_time + seg_duration:.0f}s): {summary}")
+
+            # Re-base highlight timestamps to original video timeline
+            for h in highlights:
+                rebased_h = Highlight(
+                    start_time=round(start_time + h.start_time, 2),
+                    end_time=round(start_time + h.end_time, 2),
+                    highlight_type=h.highlight_type,
+                    description=h.description,
+                    excitement_score=h.excitement_score,
+                    involves_rainier=getattr(h, "involves_rainier", True),
+                )
+                all_highlights.append(rebased_h)
+
+            print(f"  [Chunk {i+1}/{num_chunks}] ✅ Identified {len(highlights)} highlight(s) in this segment.")
+
+        finally:
+            if temp_chunk.exists():
+                try:
+                    temp_chunk.unlink()
+                except Exception:
+                    pass
+
+    # Sort all highlights chronologically
+    all_highlights.sort(key=lambda h: h.start_time)
+
+    combined_summary = "\n".join(summaries) if summaries else "Analyzed in multiple segments."
+    creation_time = info.created_at if info else None
+
+    analysis = VideoAnalysis(
+        file_path=file_path,
+        is_basketball=is_basketball_overall,
+        summary=combined_summary,
+        highlights=all_highlights,
+        creation_time=creation_time,
+    )
+    print(f"\n  🎉 Total highlights for {path.name}: {len(all_highlights)} across all {num_chunks} segments.")
+    return analysis
+
+
+def analyze_video(
+    file_path: str,
+    client: genai.Client | None = None,
+) -> VideoAnalysis:
+    """Upload a video directly to Gemini and return a structured highlight analysis.
+
+    For files > 2GB (Gemini Files API limit), automatically splits the video into
+    manageable chunks using instant stream-copy (-c copy), analyzes each chunk, and
+    merges all highlight timestamps seamlessly back into the original video's timeline.
+
+    Args:
+        file_path: Local path to the video file.
+        client: Optional pre-initialised :class:`genai.Client`.
+
+    Returns:
+        A populated :class:`VideoAnalysis` instance.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Video file not found: {file_path}")
+
+    if client is None:
+        client = genai.Client()
+
+    file_size = path.stat().st_size
+
+    # Check if video exceeds Gemini 2.0GB limit
+    if file_size > _MAX_GEMINI_FILE_BYTES:
+        return _split_and_analyze_large_video(file_path, client)
+
+    # Direct single-file upload (<= 2GB)
+    is_bball, summary, highlights = _analyze_single_file_direct(file_path, client)
+    info = get_video_info(file_path)
+    creation_time = info.created_at if info else None
+
+    analysis = VideoAnalysis(
+        file_path=file_path,
+        is_basketball=is_bball,
+        summary=summary,
+        highlights=highlights,
+        creation_time=creation_time,
+    )
+    print(f"  ✅ Found {len(highlights)} highlight(s) in {path.name}")
+    return analysis
 
 
 
