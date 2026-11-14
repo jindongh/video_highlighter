@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local SQLite databases and caches
+*.db
+*.sqlite3
+.analysis_cache.json
+analysis.json
+
+# Generated video outputs & players
+highlights.mp4
+highlights.html
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Environment & API keys
+.env
+
+# OS and Editor artifacts
+.DS_Store
+.idea/
+.vscode/
