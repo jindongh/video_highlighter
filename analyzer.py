@@ -207,9 +207,18 @@ def _analyze_single_file_direct(
 
     uploaded_file = None
     try:
-        # -- 1. Upload directly --
+        # -- 1. Upload directly (with retries for network glitches) --
         print(f"  ↑ Uploading {name} ({size_mb:.1f}MB) directly to Gemini …")
-        uploaded_file = client.files.upload(file=str(path))
+        for up_attempt in range(1, 4):
+            try:
+                uploaded_file = client.files.upload(file=str(path))
+                break
+            except Exception as up_exc:
+                if up_attempt < 3:
+                    print(f"  ⚠ Upload attempt {up_attempt}/3 failed ({up_exc}). Retrying in 5s …")
+                    time.sleep(5.0)
+                else:
+                    raise
 
         # -- 2. Wait for Gemini cloud processing --
         print(f"  ⏳ Waiting for Gemini cloud processing for {name} …")
@@ -403,7 +412,7 @@ def analyze_video(
         raise FileNotFoundError(f"Video file not found: {file_path}")
 
     if client is None:
-        client = genai.Client(http_options=types.HttpOptions(timeout=_API_TIMEOUT_S))
+        client = genai.Client()
 
     file_size = path.stat().st_size
 
@@ -631,7 +640,7 @@ def analyze_videos(
         An :class:`AnalysisResult` containing all successful analyses.
     """
     result = AnalysisResult()
-    client = genai.Client(http_options=types.HttpOptions(timeout=_API_TIMEOUT_S))
+    client = genai.Client()
     conn = get_db_connection(db_path)
 
     cache: dict[str, dict[str, Any]] = (
