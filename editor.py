@@ -50,24 +50,44 @@ def get_video_duration(file_path: str) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _probe_clip_format(file_path: str) -> tuple[int, int, str]:
+    """Return (width, height, codec_name) of video stream using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,codec_name",
+        "-of", "csv=p=0",
+        file_path,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        parts = res.stdout.strip().split(",")
+        return (int(parts[0]), int(parts[1]), parts[2])
+    except Exception:
+        return (0, 0, "")
+
+
 def extract_clip(
     source_path: str,
     start_time: float,
     end_time: float,
     output_path: str,
-    reencode: bool = False,
+    normalize: bool = False,
 ) -> bool:
     """Extract a clip from *source_path* between *start_time* and *end_time*.
 
-    Defaults to fast stream-copy (``-c copy``), which takes less than 0.5s
-    per clip without any CPU re-encoding overhead.
+    If *normalize* is False (same camera source), uses fast stream-copy (-c copy),
+    stripping hardware timecode tracks (tmcd).
+    If *normalize* is True (multi-camera mix like DJI 2.7K + Pixel 1080p),
+    normalizes the clip to standard 1080p 30fps H.264 so all clips can be
+    concatenated seamlessly without corruption or freezing in the second half.
 
     Args:
         source_path: Path to the source video.
         start_time: Start position in seconds.
         end_time: End position in seconds.
         output_path: Destination path for the extracted clip.
-        reencode: If True, re-encodes the video (much slower on weak CPUs).
+        normalize: If True, normalizes resolution to 1080p and framerate to 30fps.
 
     Returns:
         ``True`` on success, ``False`` on failure.
@@ -77,24 +97,27 @@ def extract_clip(
         print(f"[editor] Invalid clip range: {start_time:.2f}–{end_time:.2f}")
         return False
 
-    if not reencode:
-        # Fast stream-copy: instantaneous (0.3s), 0% CPU overhead
+    if not normalize:
+        # Fast stream-copy: instantaneous (0.3s), strip DJI tmcd timecode track
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(start_time),
-            "-to", str(end_time),
+            "-ss", f"{start_time:.2f}",
             "-i", source_path,
+            "-t", f"{duration:.2f}",
+            "-map", "0:v:0", "-map", "0:a:0?",
             "-c", "copy",
             output_path,
         ]
     else:
+        # Normalize to standard 1080p 30fps H.264 AAC (prevents mid-stream resolution crashes)
         cmd = [
             "ffmpeg", "-y",
-            "-ss", str(start_time),
-            "-to", str(end_time),
+            "-ss", f"{start_time:.2f}",
             "-i", source_path,
-            "-c:v", "libx264", "-crf", "26", "-preset", "ultrafast",
-            "-c:a", "aac",
+            "-t", f"{duration:.2f}",
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             output_path,
         ]
 
@@ -161,6 +184,21 @@ def prepare_clips(
         )
         print(f"[editor] ⭐ Sorting {len(all_highlights)} highlights by excitement score")
 
+    # Check if clips originate from multiple distinct video formats (e.g. DJI 2.7K + Pixel 1080p)
+    source_files = {item[0] for item in all_highlights}
+    formats = set()
+    for sf in source_files:
+        fmt = _probe_clip_format(sf)
+        if fmt[0] > 0 and fmt[1] > 0:
+            formats.add(fmt)
+
+    is_mixed_cameras = len(formats) > 1
+    if is_mixed_cameras:
+        print(f"[editor] ⚠️ Detected multiple camera formats ({len(formats)} distinct resolutions/codecs): {formats}")
+        print("[editor] 🔄 Automatically normalizing all clips to 1080p 30fps H.264 to prevent playback corruption...")
+    else:
+        print("[editor] ⚡ Uniform camera format detected — using ultra-fast stream-copy.")
+
     clip_paths: list[str] = []
     for idx, (source_path, highlight, abs_time) in enumerate(all_highlights, start=1):
         # Apply buffer and cap duration.
@@ -176,9 +214,8 @@ def prepare_clips(
         time_str = abs_time.strftime("%H:%M:%S") if abs_time != min_epoch else f"{start:.1f}s"
         print(f"[editor] Clip #{idx:02d} [{time_str}] {getattr(highlight, 'description', '')[:50]}")
 
-        if extract_clip(source_path, start, end, clip_path):
+        if extract_clip(source_path, start, end, clip_path, normalize=is_mixed_cameras):
             clip_paths.append(clip_path)
-
 
     print(f"[editor] Prepared {len(clip_paths)}/{len(all_highlights)} clips")
     return clip_paths
