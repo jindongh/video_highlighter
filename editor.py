@@ -61,8 +61,11 @@ def _probe_clip_format(file_path: str) -> tuple[int, int, str]:
     ]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        parts = res.stdout.strip().split(",")
-        return (int(parts[0]), int(parts[1]), parts[2])
+        parts = [p.strip() for p in res.stdout.strip().split(",")]
+        # ffprobe returns codec_name,width,height
+        if len(parts) >= 3:
+            return (int(parts[1]), int(parts[2]), parts[0])
+        return (0, 0, "")
     except Exception:
         return (0, 0, "")
 
