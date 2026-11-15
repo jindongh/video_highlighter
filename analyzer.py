@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from google import genai
+from google.genai import types
 
 from models import AnalysisResult, Highlight, VideoAnalysis, VideoInfo
 from scanner import get_video_info
@@ -40,10 +41,23 @@ from db import DEFAULT_DB_PATH, get_db_connection, get_video_analysis, save_vide
 # ---------------------------------------------------------------------------
 
 _MODEL = "gemini-3.8-flash"
-_MAX_RETRIES = 5
-_INITIAL_BACKOFF_S = 2.0
+_MAX_RETRIES = 6
+_INITIAL_BACKOFF_S = 5.0
 _INTER_REQUEST_DELAY_S = 2.0
 _FILE_POLL_INTERVAL_S = 5
+_FILE_POLL_TIMEOUT_S = 300   # 5 minutes max wait for Gemini file state
+_API_TIMEOUT_S = 180         # 3 minutes timeout for Gemini interaction request
+
+# Transient / recoverable errors to automatically retry with exponential backoff
+_RETRYABLE_KEYWORDS = (
+    "429", "rate", "resource_exhausted", "quota",
+    "503", "service_unavailable", "high demand", "spikes in demand",
+    "500", "internal_server_error", "internalservererror",
+    "502", "bad gateway", "badgateway",
+    "504", "gateway timeout", "gatewaytimeout",
+    "timeout", "timed out", "deadline",
+    "connection", "remote disconnected", "connection reset", "econnreset",
+)
 
 # Gemini Files API free tier limit is 2.0 GB (2,147,483,648 bytes)
 _MAX_GEMINI_FILE_BYTES = int(1.95 * 1024 * 1024 * 1024)   # 1.95 GB safe threshold
@@ -199,7 +213,13 @@ def _analyze_single_file_direct(
 
         # -- 2. Wait for Gemini cloud processing --
         print(f"  ⏳ Waiting for Gemini cloud processing for {name} …")
+        poll_start = time.time()
         while not uploaded_file.state or uploaded_file.state.name != "ACTIVE":
+            if uploaded_file.state and uploaded_file.state.name == "FAILED":
+                err_msg = getattr(uploaded_file, "error", "unknown remote processing error")
+                raise RuntimeError(f"Gemini remote file processing failed for {name}: {err_msg}")
+            if time.time() - poll_start > _FILE_POLL_TIMEOUT_S:
+                raise TimeoutError(f"Gemini remote file processing timed out after {_FILE_POLL_TIMEOUT_S}s for {name}")
             time.sleep(_FILE_POLL_INTERVAL_S)
             uploaded_file = client.files.get(name=uploaded_file.name)
 
@@ -383,7 +403,7 @@ def analyze_video(
         raise FileNotFoundError(f"Video file not found: {file_path}")
 
     if client is None:
-        client = genai.Client()
+        client = genai.Client(http_options=types.HttpOptions(timeout=_API_TIMEOUT_S))
 
     file_size = path.stat().st_size
 
@@ -451,19 +471,27 @@ def _request_with_backoff(
                     "mime_type": "application/json",
                     "schema": _get_response_schema(),
                 },
+                timeout=_API_TIMEOUT_S,
             )
             return interaction
 
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            exc_str = str(exc).lower()
-            if "429" in exc_str or "rate" in exc_str or "resource_exhausted" in exc_str:
+            exc_str = f"{type(exc).__name__}: {str(exc)}".lower()
+            is_transient = any(kw in exc_str for kw in _RETRYABLE_KEYWORDS)
+
+            if is_transient and attempt < _MAX_RETRIES:
+                reason = "Server high demand / 503" if ("503" in exc_str or "high demand" in exc_str) else (
+                    "Rate limit / 429" if ("429" in exc_str or "rate" in exc_str) else (
+                        "Request timeout" if "timeout" in exc_str else "Transient network error"
+                    )
+                )
                 print(
-                    f"  ⚠ Rate limited (attempt {attempt}/{_MAX_RETRIES}). "
+                    f"  ⚠ {reason} (attempt {attempt}/{_MAX_RETRIES}). "
                     f"Retrying in {backoff:.0f}s …"
                 )
                 time.sleep(backoff)
-                backoff *= 2
+                backoff = min(backoff * 2, 60.0)
             else:
                 raise
 
@@ -603,7 +631,7 @@ def analyze_videos(
         An :class:`AnalysisResult` containing all successful analyses.
     """
     result = AnalysisResult()
-    client = genai.Client()
+    client = genai.Client(http_options=types.HttpOptions(timeout=_API_TIMEOUT_S))
     conn = get_db_connection(db_path)
 
     cache: dict[str, dict[str, Any]] = (
